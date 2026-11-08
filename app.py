@@ -192,51 +192,155 @@ def classify_report(text: str) -> str:
 
 def parse_simple_lab_rows(text: str):
     """
-    Conservative prototype parser.
+    Extract laboratory results from multi-line PDF layouts.
+
+    Expected structure:
+
+    Test Name
+    Unit
+    Reference Range
+    Testing Method
+    Result
 
     Example:
-    Hemoglobin 13.5 g/dL 12.0 - 16.0
-
-    This parser supports only simple text formats.
+    Hemoglobin
+    g/dL
+    13.0 - 16.5
+    Colorimetric
+    14.5
     """
 
     rows = []
 
-    pattern = re.compile(
-        r"(?im)^\s*([A-Za-z][A-Za-z0-9 ()/%.-]{1,45}?)\s+"
-        r"([-+]?\d+(?:\.\d+)?)\s*"
-        r"([A-Za-zµμ/%^0-9.]+)?\s+"
-        r"([-+]?\d+(?:\.\d+)?)\s*(?:-|to)\s*"
-        r"([-+]?\d+(?:\.\d+)?)\s*$"
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    # Recognize numerical reference ranges
+    range_pattern = re.compile(
+        r"^([-+]?\d+(?:\.\d+)?)\s*"
+        r"(?:-|–|—|to)\s*"
+        r"([-+]?\d+(?:\.\d+)?)$",
+        re.IGNORECASE
     )
 
-    for match in pattern.finditer(text):
+    # Recognize units
+    unit_pattern = re.compile(
+        r"^(?:"
+        r"g/dL|mg/dL|mg/L|mmol/L|µmol/L|umol/L|"
+        r"million/cmm|million/µL|million/uL|"
+        r"/cmm|/µL|/uL|%"
+        r"|fL|pg|ng/mL|U/L|IU/L|mIU/L|"
+        r"mm/1hr|mm/hr|seconds|sec"
+        r")$",
+        re.IGNORECASE
+    )
 
-        name, value, unit, low, high = match.groups()
+    # Recognize numeric result values
+    number_pattern = re.compile(
+        r"^[-+]?\d+(?:\.\d+)?$"
+    )
 
-        value = float(value)
-        low = float(low)
-        high = float(high)
+    # Avoid treating section headings as test names
+    excluded_names = {
+        "complete blood count",
+        "differential count",
+        "total wbc and differential count",
+        "absolute count",
+        "peripheral smear examination",
+        "sample information",
+        "patient information",
+        "platelet count examination"
+    }
 
-        if low <= value <= high:
+    used_names = set()
+
+    for i, line in enumerate(lines):
+
+        # Step 1: Find a reference range
+        range_match = range_pattern.match(line)
+
+        if not range_match:
+            continue
+
+        low = float(range_match.group(1))
+        high = float(range_match.group(2))
+
+        # Step 2: Find the unit before the reference range
+        unit_index = None
+
+        for j in range(i - 1, max(-1, i - 4), -1):
+
+            if unit_pattern.match(lines[j]):
+                unit_index = j
+                break
+
+        if unit_index is None:
+            continue
+
+        # Step 3: Find the test name before the unit
+        name_index = unit_index - 1
+
+        # Skip H/L flags
+        while (
+            name_index >= 0
+            and lines[name_index].upper() in ["H", "L", "HIGH", "LOW"]
+        ):
+            name_index -= 1
+
+        if name_index < 0:
+            continue
+
+        name = lines[name_index].strip()
+
+        # Avoid headings and duplicate rows
+        if name.lower() in excluded_names:
+            continue
+
+        if number_pattern.match(name):
+            continue
+
+        if len(name) > 60:
+            continue
+
+        if name in used_names:
+            continue
+
+        # Step 4: Find the result after the reference range
+        result = None
+
+        for k in range(i + 1, min(i + 4, len(lines))):
+
+            if number_pattern.match(lines[k]):
+                result = float(lines[k])
+                break
+
+        if result is None:
+            continue
+
+        # Step 5: Determine status against the stated range
+        if low <= result <= high:
             status = "Within stated range"
 
-        elif value < low:
+        elif result < low:
             status = "Below stated range"
 
         else:
             status = "Above stated range"
 
         rows.append({
-            "Parameter": name.strip(),
-            "Result": value,
-            "Unit": unit or "",
+            "Parameter": name,
+            "Result": result,
+            "Unit": lines[unit_index],
             "Reference range": f"{low:g} - {high:g}",
             "Prototype status": status
         })
 
-    return rows
+        used_names.add(name)
 
+    return rows
 
 # --------------------------------------------------
 # 5. BANGLA EXPLANATION
