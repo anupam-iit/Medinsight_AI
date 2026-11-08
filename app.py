@@ -1,104 +1,232 @@
 import re
-import streamlit as st
-import pymupdf
-import fitz
-import pytesseract
-
-from PIL import Image
 from io import BytesIO
 
-st.set_page_config(page_title="MediInsight AI", page_icon="🩺", layout="wide")
+import streamlit as st
+import pymupdf
+import pytesseract
 
-st.title("🩺 MediInsight AI")
-st.caption("Medical report understanding assistant — academic prototype")
+from PIL import Image, ImageOps, ImageEnhance
 
-st.warning(
-    "Educational prototype only. It does not diagnose, calculate disease probability, "
-    "or replace a qualified healthcare professional. Do not upload identifiable or "
-    "confidential patient reports."
+
+# --------------------------------------------------
+# 1. PAGE CONFIGURATION
+# --------------------------------------------------
+
+st.set_page_config(
+    page_title="MediInsight AI",
+    page_icon="🩺",
+    layout="wide"
 )
 
-def extract_pdf_text(pdf_bytes: bytes):
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for page_no, page in enumerate(doc, start=1):
-        pages.append(f"\n--- Page {page_no} ---\n{page.get_text('text')}")
-    doc.close()
-    return "\n".join(pages).strip()
+st.title("🩺 MediInsight AI")
 
-def extract_pdf_content(pdf_file):
+st.caption(
+    "Medical Report Understanding Assistant — Academic Prototype"
+)
 
-    doc = fitz.open(stream=pdf_file, filetype="pdf")
+st.warning(
+    "Educational prototype only. It does not diagnose, calculate disease "
+    "probability, or replace a qualified healthcare professional. "
+    "Do not upload identifiable or confidential patient reports."
+)
+
+
+# --------------------------------------------------
+# 2. PDF EXTRACTION WITH OCR
+# --------------------------------------------------
+
+def preprocess_image(image):
+    """
+    Basic image preprocessing to improve OCR readability.
+    """
+
+    image = ImageOps.grayscale(image)
+
+    image = ImageEnhance.Contrast(image).enhance(1.5)
+
+    return image
+
+
+def extract_pdf_content(pdf_bytes: bytes):
+    """
+    Extract text from every PDF page.
+
+    Method:
+    1. Extract selectable text.
+    2. If insufficient text is found, apply OCR.
+    3. Return page-wise text and extraction details.
+    """
 
     extracted_pages = []
 
-    for page_number, page in enumerate(doc, start=1):
+    try:
+        doc = pymupdf.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
 
-        # Step 1: Extract selectable text
-        text = page.get_text("text").strip()
+        if doc.page_count == 0:
+            raise ValueError("The PDF contains no pages.")
 
-        # Step 2: Check whether OCR is required
-        if len(text) < 50:
+        for page_number, page in enumerate(doc, start=1):
 
-            pix = page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
-                alpha=False
-            )
+            # Step 1: Extract selectable text
+            text = page.get_text("text").strip()
 
-            image = Image.open(
-                BytesIO(pix.tobytes("png"))
-            )
+            extraction_method = "Selectable text"
+            ocr_used = False
 
-            # Step 3: Apply OCR
-            text = pytesseract.image_to_string(
-                image,
-                lang="eng"
-            )
+            # Step 2: Apply OCR if selectable text is insufficient
+            if len(text) < 80:
 
-        extracted_pages.append({
-            "page": page_number,
-            "text": text.strip()
-        })
+                extraction_method = "OCR"
+                ocr_used = True
 
-    doc.close()
+                # Render page at approximately 300 DPI
+                pix = page.get_pixmap(
+                    matrix=pymupdf.Matrix(300 / 72, 300 / 72),
+                    alpha=False
+                )
 
-    return extracted_pages
+                image = Image.open(
+                    BytesIO(pix.tobytes("png"))
+                )
+
+                # Step 3: Preprocess image
+                image = preprocess_image(image)
+
+                # Step 4: Apply OCR
+                ocr_text = pytesseract.image_to_string(
+                    image,
+                    lang="eng",
+                    config="--psm 3"
+                ).strip()
+
+                # Use OCR result for this page
+                if ocr_text:
+                    text = ocr_text
+                else:
+                    text = text or "[No readable text detected on this page]"
+
+            extracted_pages.append({
+                "page": page_number,
+                "text": text,
+                "method": extraction_method,
+                "ocr_used": ocr_used,
+                "characters": len(text)
+            })
+
+        doc.close()
+
+        return extracted_pages
+
+    except Exception as e:
+        raise RuntimeError(f"PDF extraction failed: {str(e)}")
+
+
+# --------------------------------------------------
+# 3. REPORT CLASSIFICATION
+# --------------------------------------------------
 
 def classify_report(text: str) -> str:
+
     t = text.lower()
+
     categories = {
-        "Laboratory / Pathology": ["hemoglobin", "haemoglobin", "platelet", "wbc", "rbc", "glucose", "cholesterol"],
-        "Radiology": ["ultrasound", "sonography", "x-ray", "xray", "ct scan", "mri", "impression", "radiologist"],
-        "Cardiology": ["ecg", "ekg", "echocardiogram", "ejection fraction", "心"],
-        "Histopathology": ["histopathology", "biopsy", "specimen", "microscopy", "malignant"],
+        "Laboratory / Pathology": [
+            "hemoglobin",
+            "haemoglobin",
+            "platelet",
+            "wbc",
+            "rbc",
+            "glucose",
+            "cholesterol",
+            "creatinine",
+            "bilirubin"
+        ],
+
+        "Radiology": [
+            "ultrasound",
+            "sonography",
+            "x-ray",
+            "xray",
+            "ct scan",
+            "mri",
+            "impression",
+            "radiologist"
+        ],
+
+        "Cardiology": [
+            "ecg",
+            "ekg",
+            "echocardiogram",
+            "ejection fraction",
+            "cardiac"
+        ],
+
+        "Histopathology": [
+            "histopathology",
+            "biopsy",
+            "specimen",
+            "microscopy",
+            "malignant"
+        ]
     }
-    scores = {name: sum(term in t for term in terms) for name, terms in categories.items()}
+
+    scores = {
+        name: sum(term in t for term in terms)
+        for name, terms in categories.items()
+    }
+
     best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "General / Unclassified medical report"
+
+    if scores[best] > 0:
+        return best
+
+    return "General / Unclassified medical report"
+
+
+# --------------------------------------------------
+# 4. LABORATORY VALUE EXTRACTION
+# --------------------------------------------------
 
 def parse_simple_lab_rows(text: str):
     """
     Conservative prototype parser.
-    Matches simple lines such as:
+
+    Example:
     Hemoglobin 13.5 g/dL 12.0 - 16.0
-    Real-world reports vary widely; this is not a production parser.
+
+    This parser supports only simple text formats.
     """
+
     rows = []
+
     pattern = re.compile(
         r"(?im)^\s*([A-Za-z][A-Za-z0-9 ()/%.-]{1,45}?)\s+"
         r"([-+]?\d+(?:\.\d+)?)\s*"
         r"([A-Za-zµμ/%^0-9.]+)?\s+"
-        r"([-+]?\d+(?:\.\d+)?)\s*(?:-|to)\s*([-+]?\d+(?:\.\d+)?)\s*$"
+        r"([-+]?\d+(?:\.\d+)?)\s*(?:-|to)\s*"
+        r"([-+]?\d+(?:\.\d+)?)\s*$"
     )
+
     for match in pattern.finditer(text):
+
         name, value, unit, low, high = match.groups()
-        value, low, high = float(value), float(low), float(high)
+
+        value = float(value)
+        low = float(low)
+        high = float(high)
+
         if low <= value <= high:
             status = "Within stated range"
+
         elif value < low:
             status = "Below stated range"
+
         else:
             status = "Above stated range"
+
         rows.append({
             "Parameter": name.strip(),
             "Result": value,
@@ -106,81 +234,303 @@ def parse_simple_lab_rows(text: str):
             "Reference range": f"{low:g} - {high:g}",
             "Prototype status": status
         })
+
     return rows
 
-def explain_status_bangla(status: str):
-    mapping = {
-        "Within stated range": "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার মধ্যে আছে।",
-        "Below stated range": "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার নিচে। চিকিৎসকের সঙ্গে আলোচনা করুন।",
-        "Above stated range": "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার উপরে। চিকিৎসকের সঙ্গে আলোচনা করুন।",
-    }
-    return mapping.get(status, "এই ফলাফলটি চিকিৎসকের সঙ্গে আলোচনা করুন।")
 
-uploaded = st.file_uploader("Upload a medical report (PDF)", type=["pdf"])
+# --------------------------------------------------
+# 5. BANGLA EXPLANATION
+# --------------------------------------------------
+
+def explain_status_bangla(status: str):
+
+    mapping = {
+
+        "Within stated range":
+            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার মধ্যে আছে।",
+
+        "Below stated range":
+            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার নিচে। "
+            "চিকিৎসকের সঙ্গে আলোচনা করুন।",
+
+        "Above stated range":
+            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার উপরে। "
+            "চিকিৎসকের সঙ্গে আলোচনা করুন।"
+    }
+
+    return mapping.get(
+        status,
+        "এই ফলাফলটি চিকিৎসকের সঙ্গে আলোচনা করুন।"
+    )
+
+
+# --------------------------------------------------
+# 6. PDF UPLOAD
+# --------------------------------------------------
+
+uploaded = st.file_uploader(
+    "Upload a medical report (PDF)",
+    type=["pdf"]
+)
+
 
 if uploaded:
+
     pdf_bytes = uploaded.getvalue()
+
+    # File size validation
     if len(pdf_bytes) > 15 * 1024 * 1024:
-        st.error("For this prototype, please upload a PDF smaller than 15 MB.")
-        st.stop()
 
-    with st.spinner("Extracting text from PDF..."):
-        extracted_text = extract_pdf_text(pdf_bytes)
-
-    if not extracted_text or len(extracted_text) < 30:
         st.error(
-            "Little or no selectable text was found. This may be a scanned PDF. "
-            "OCR support will be added in the next development phase."
+            "For this prototype, please upload a PDF smaller than 15 MB."
         )
-        st.info("For now, test with a text-based PDF.")
+
         st.stop()
 
-    report_type = classify_report(extracted_text)
-    st.success(f"Document processed. Detected category: **{report_type}**")
+    # --------------------------------------------------
+    # 7. PROCESS ALL PDF PAGES
+    # --------------------------------------------------
 
-    tab1, tab2, tab3 = st.tabs(["Overview", "Extracted text", "Structured findings"])
+    try:
+
+        with st.spinner(
+            "Processing PDF pages. OCR may take some time..."
+        ):
+
+            pages = extract_pdf_content(pdf_bytes)
+
+        # Combine text from all pages
+        extracted_text = "\n\n".join(
+            f"--- Page {page['page']} ---\n{page['text']}"
+            for page in pages
+        )
+
+    except Exception as e:
+
+        st.error(str(e))
+        st.stop()
+
+    # --------------------------------------------------
+    # 8. EXTRACTION SUMMARY
+    # --------------------------------------------------
+
+    total_pages = len(pages)
+
+    total_characters = sum(
+        page["characters"] for page in pages
+    )
+
+    ocr_pages = sum(
+        1 for page in pages if page["ocr_used"]
+    )
+
+    st.success(
+        f"PDF processing completed. "
+        f"Detected category: {classify_report(extracted_text)}"
+    )
+
+    # --------------------------------------------------
+    # 9. TABS
+    # --------------------------------------------------
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Overview",
+        "Extracted Text",
+        "Page Diagnostics",
+        "Structured Findings"
+    ])
+
+    # --------------------------------------------------
+    # TAB 1: OVERVIEW
+    # --------------------------------------------------
 
     with tab1:
-        c1, c2 = st.columns(2)
-        c1.metric("Pages", extracted_text.count("--- Page"))
-        c2.metric("Extracted characters", f"{len(extracted_text):,}")
-        st.info(
-            "This prototype identifies the document category using keywords. "
-            "It does not yet interpret radiology images, ECG waveforms, or diagnose conditions."
+
+        report_type = classify_report(extracted_text)
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Total Pages",
+            total_pages
         )
 
+        col2.metric(
+            "Extracted Characters",
+            f"{total_characters:,}"
+        )
+
+        col3.metric(
+            "OCR Pages",
+            ocr_pages
+        )
+
+        st.subheader("Report Information")
+
+        st.write(
+            f"**Detected Report Category:** {report_type}"
+        )
+
+        st.write(
+            f"**Total Pages Processed:** {total_pages}"
+        )
+
+        st.write(
+            f"**Pages Processed Using OCR:** {ocr_pages}"
+        )
+
+        st.info(
+            "This prototype identifies report categories using keywords "
+            "and extracts basic text. It does not yet interpret medical "
+            "images, ECG waveforms, or diagnose conditions."
+        )
+
+    # --------------------------------------------------
+    # TAB 2: EXTRACTED TEXT
+    # --------------------------------------------------
+
     with tab2:
-        st.text_area("Extracted PDF text", extracted_text, height=420)
+
+        st.subheader("Complete Extracted Report")
+
+        st.text_area(
+            "Extracted PDF Text",
+            extracted_text,
+            height=600
+        )
+
+        st.download_button(
+            label="Download Extracted Text",
+            data=extracted_text,
+            file_name="extracted_medical_report.txt",
+            mime="text/plain"
+        )
+
+    # --------------------------------------------------
+    # TAB 3: PAGE DIAGNOSTICS
+    # --------------------------------------------------
 
     with tab3:
+
+        st.subheader("Page-by-Page Extraction Status")
+
+        for page in pages:
+
+            with st.expander(
+                f"Page {page['page']} — "
+                f"{page['method']} — "
+                f"{page['characters']} characters"
+            ):
+
+                st.write(
+                    f"**Extraction Method:** {page['method']}"
+                )
+
+                st.write(
+                    f"**Extracted Characters:** {page['characters']}"
+                )
+
+                if page["ocr_used"]:
+                    st.info("OCR was applied to this page.")
+
+                else:
+                    st.success(
+                        "Selectable PDF text was extracted."
+                    )
+
+                if page["characters"] < 30:
+
+                    st.warning(
+                        "Very little readable text was detected. "
+                        "Please verify this page against the original PDF."
+                    )
+
+                st.text_area(
+                    f"Page {page['page']} content",
+                    page["text"],
+                    height=200,
+                    key=f"page_text_{page['page']}"
+                )
+
+    # --------------------------------------------------
+    # TAB 4: STRUCTURED FINDINGS
+    # --------------------------------------------------
+
+    with tab4:
+
         lab_rows = parse_simple_lab_rows(extracted_text)
+
         if lab_rows:
-            st.subheader("Possible laboratory values")
-            st.caption("Prototype extraction only. Verify every value against the original report.")
-            st.dataframe(lab_rows, use_container_width=True, hide_index=True)
-            for row in lab_rows:
+
+            st.subheader("Possible Laboratory Values")
+
+            st.caption(
+                "Experimental extraction only. "
+                "Verify every value against the original report."
+            )
+
+            st.dataframe(
+                lab_rows,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader("Result Overview")
+
+            for index, row in enumerate(lab_rows):
+
                 with st.container(border=True):
-                    st.markdown(f"**{row['Parameter']} — {row['Result']} {row['Unit']}**")
+
+                    st.markdown(
+                        f"**{row['Parameter']} — "
+                        f"{row['Result']} {row['Unit']}**"
+                    )
+
+                    st.write(
+                        f"Reference Range: {row['Reference range']}"
+                    )
+
                     status = row["Prototype status"]
+
                     if status == "Within stated range":
+
                         st.success(status)
+
                     else:
+
                         st.warning(status)
-                    st.write(explain_status_bangla(status))
+
+                    st.write(
+                        explain_status_bangla(status)
+                    )
+
         else:
+
             st.info(
-                "No simple laboratory rows were detected. This is expected for many "
-                "radiology, cardiology, and narrative reports. A report-specific extraction "
+                "No simple laboratory values were detected. "
+                "This is expected for many radiology, cardiology, "
+                "and narrative reports. A report-specific extraction "
                 "module is needed for each document family."
             )
 
-    st.download_button(
-        "Download extracted text",
-        data=extracted_text,
-        file_name="extracted_report_text.txt",
-        mime="text/plain"
-    )
+
+# --------------------------------------------------
+# 10. INITIAL SCREEN
+# --------------------------------------------------
+
 else:
-    st.markdown("### Planned workflow")
-    st.write("1. Upload PDF  →  2. Extract text  →  3. Structure findings  →  4. Explain in Bangla/English  →  5. Ask follow-up questions")
-    st.info("Start with anonymized sample reports and text-based PDFs.")
+
+    st.markdown("### Planned Workflow")
+
+    st.write(
+        "1. Upload PDF"
+        "  →  2. Extract Text"
+        "  →  3. Structure Findings"
+        "  →  4. Explain in Bangla / English"
+        "  →  5. Ask Follow-up Questions"
+    )
+
+    st.info(
+        "Start with anonymized sample reports. "
+        "Both text-based and scanned PDFs are supported by the prototype."
+    )
