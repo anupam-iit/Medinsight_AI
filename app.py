@@ -1,16 +1,23 @@
-import re
-from io import BytesIO
-
 import streamlit as st
-import pymupdf
-import pytesseract
+import fitz
+import requests
+import json
+import textwrap
+import io
 
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image
+
+# Optional OCR dependency
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 
-# --------------------------------------------------
-# 1. PAGE CONFIGURATION
-# --------------------------------------------------
+# =========================================================
+# 1. APPLICATION CONFIGURATION
+# =========================================================
 
 st.set_page_config(
     page_title="MediInsight AI",
@@ -18,623 +25,1057 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🩺 MediInsight AI")
+OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "qwen2.5:3b"
 
-st.caption(
-    "Medical Report Understanding Assistant — Academic Prototype"
-)
-
-st.warning(
-    "Educational prototype only. It does not diagnose, calculate disease "
-    "probability, or replace a qualified healthcare professional. "
-    "Do not upload identifiable or confidential patient reports."
-)
+MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_CHUNK_SIZE = 7000
 
 
-# --------------------------------------------------
-# 2. PDF EXTRACTION WITH OCR
-# --------------------------------------------------
+# =========================================================
+# 2. APPLICATION DESIGN
+# =========================================================
 
-def preprocess_image(image):
-    """
-    Basic image preprocessing to improve OCR readability.
-    """
+st.markdown("""
+<style>
 
-    image = ImageOps.grayscale(image)
+@import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
-    image = ImageEnhance.Contrast(image).enhance(1.5)
+html, body, [class*="css"] {
+    font-family: 'Inter', 'Hind Siliguri', sans-serif;
+}
 
-    return image
+.main {
+    background-color: #f5f8fa;
+}
+
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+    max-width: 1250px;
+}
+
+.header-box {
+    background: linear-gradient(120deg, #063b46, #087e83);
+    padding: 30px;
+    border-radius: 16px;
+    color: white;
+    margin-bottom: 25px;
+}
+
+.header-title {
+    font-size: 34px;
+    font-weight: 700;
+    margin-bottom: 5px;
+}
+
+.header-subtitle {
+    font-size: 16px;
+    opacity: 0.9;
+}
+
+.section-title {
+    font-size: 23px;
+    font-weight: 700;
+    margin-top: 20px;
+    margin-bottom: 15px;
+}
+
+.info-note {
+    background: #e8f3f5;
+    border-left: 5px solid #087e83;
+    padding: 14px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+
+.footer {
+    text-align: center;
+    color: #777;
+    padding: 25px;
+    font-size: 13px;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 
-def extract_pdf_content(pdf_bytes: bytes):
-    """
-    Extract text from every PDF page.
+# =========================================================
+# 3. HEADER
+# =========================================================
 
-    Method:
-    1. Extract selectable text.
-    2. If insufficient text is found, apply OCR.
-    3. Return page-wise text and extraction details.
-    """
+st.markdown("""
+<div class="header-box">
+
+    <div class="header-title">
+        🩺 MediInsight AI
+    </div>
+
+    <div class="header-subtitle">
+        Your Medical Report Understanding Assistant
+        <br>
+        Medical reports explained in simple Bangla
+    </div>
+
+</div>
+""", unsafe_allow_html=True)
+
+
+st.markdown("""
+<div class="info-note">
+
+<b>Privacy:</b> Your uploaded report is processed by the
+locally running AI model on this computer. This application
+does not send report content to Gemini or OpenAI.
+
+<b>Important:</b> AI-generated explanations are informational,
+not medical diagnoses. Consult a qualified healthcare
+professional for medical decisions.
+
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# 4. PDF EXTRACTION
+# =========================================================
+
+def extract_pdf_content(pdf_bytes, run_ocr=False):
 
     extracted_pages = []
 
-    try:
-        doc = pymupdf.open(
-            stream=pdf_bytes,
-            filetype="pdf"
+    pdf = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
+
+    for page_number, page in enumerate(pdf):
+
+        native_text = page.get_text("text").strip()
+
+        extracted_text = native_text
+        extraction_method = "PDF Text"
+
+        should_run_ocr = (
+            OCR_AVAILABLE and
+            (len(native_text) < 80 or run_ocr)
         )
 
-        if doc.page_count == 0:
-            raise ValueError("The PDF contains no pages.")
+        if should_run_ocr:
 
-        for page_number, page in enumerate(doc, start=1):
+            try:
 
-            # Step 1: Extract selectable text
-            text = page.get_text("text").strip()
-
-            extraction_method = "Selectable text"
-            ocr_used = False
-
-            # Step 2: Apply OCR if selectable text is insufficient
-            if len(text) < 80:
-
-                extraction_method = "OCR"
-                ocr_used = True
-
-                # Render page at approximately 300 DPI
                 pix = page.get_pixmap(
-                    matrix=pymupdf.Matrix(300 / 72, 300 / 72),
+                    matrix=fitz.Matrix(2, 2),
                     alpha=False
                 )
 
                 image = Image.open(
-                    BytesIO(pix.tobytes("png"))
+                    io.BytesIO(pix.tobytes("png"))
                 )
 
-                # Step 3: Preprocess image
-                image = preprocess_image(image)
-
-                # Step 4: Apply OCR
                 ocr_text = pytesseract.image_to_string(
                     image,
                     lang="eng",
                     config="--psm 3"
                 ).strip()
 
-                # Use OCR result for this page
-                if ocr_text:
-                    text = ocr_text
-                else:
-                    text = text or "[No readable text detected on this page]"
+                if len(ocr_text) > len(native_text):
 
-            extracted_pages.append({
-                "page": page_number,
-                "text": text,
-                "method": extraction_method,
-                "ocr_used": ocr_used,
-                "characters": len(text)
-            })
+                    extracted_text = ocr_text
+                    extraction_method = "OCR"
 
-        doc.close()
+            except Exception:
+                pass
 
-        return extracted_pages
+        extracted_pages.append({
 
-    except Exception as e:
-        raise RuntimeError(f"PDF extraction failed: {str(e)}")
+            "page": page_number + 1,
 
+            "text": extracted_text,
 
-# --------------------------------------------------
-# 3. REPORT CLASSIFICATION
-# --------------------------------------------------
+            "method": extraction_method
 
-def classify_report(text: str) -> str:
-
-    t = text.lower()
-
-    categories = {
-        "Laboratory / Pathology": [
-            "hemoglobin",
-            "haemoglobin",
-            "platelet",
-            "wbc",
-            "rbc",
-            "glucose",
-            "cholesterol",
-            "creatinine",
-            "bilirubin"
-        ],
-
-        "Radiology": [
-            "ultrasound",
-            "sonography",
-            "x-ray",
-            "xray",
-            "ct scan",
-            "mri",
-            "impression",
-            "radiologist"
-        ],
-
-        "Cardiology": [
-            "ecg",
-            "ekg",
-            "echocardiogram",
-            "ejection fraction",
-            "cardiac"
-        ],
-
-        "Histopathology": [
-            "histopathology",
-            "biopsy",
-            "specimen",
-            "microscopy",
-            "malignant"
-        ]
-    }
-
-    scores = {
-        name: sum(term in t for term in terms)
-        for name, terms in categories.items()
-    }
-
-    best = max(scores, key=scores.get)
-
-    if scores[best] > 0:
-        return best
-
-    return "General / Unclassified medical report"
-
-
-# --------------------------------------------------
-# 4. LABORATORY VALUE EXTRACTION
-# --------------------------------------------------
-
-def parse_simple_lab_rows(text: str):
-    """
-    Extract laboratory results from multi-line PDF layouts.
-
-    Expected structure:
-
-    Test Name
-    Unit
-    Reference Range
-    Testing Method
-    Result
-
-    Example:
-    Hemoglobin
-    g/dL
-    13.0 - 16.5
-    Colorimetric
-    14.5
-    """
-
-    rows = []
-
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    # Recognize numerical reference ranges
-    range_pattern = re.compile(
-        r"^([-+]?\d+(?:\.\d+)?)\s*"
-        r"(?:-|–|—|to)\s*"
-        r"([-+]?\d+(?:\.\d+)?)$",
-        re.IGNORECASE
-    )
-
-    # Recognize units
-    unit_pattern = re.compile(
-        r"^(?:"
-        r"g/dL|mg/dL|mg/L|mmol/L|µmol/L|umol/L|"
-        r"million/cmm|million/µL|million/uL|"
-        r"/cmm|/µL|/uL|%"
-        r"|fL|pg|ng/mL|U/L|IU/L|mIU/L|"
-        r"mm/1hr|mm/hr|seconds|sec"
-        r")$",
-        re.IGNORECASE
-    )
-
-    # Recognize numeric result values
-    number_pattern = re.compile(
-        r"^[-+]?\d+(?:\.\d+)?$"
-    )
-
-    # Avoid treating section headings as test names
-    excluded_names = {
-        "complete blood count",
-        "differential count",
-        "total wbc and differential count",
-        "absolute count",
-        "peripheral smear examination",
-        "sample information",
-        "patient information",
-        "platelet count examination"
-    }
-
-    used_names = set()
-
-    for i, line in enumerate(lines):
-
-        # Step 1: Find a reference range
-        range_match = range_pattern.match(line)
-
-        if not range_match:
-            continue
-
-        low = float(range_match.group(1))
-        high = float(range_match.group(2))
-
-        # Step 2: Find the unit before the reference range
-        unit_index = None
-
-        for j in range(i - 1, max(-1, i - 4), -1):
-
-            if unit_pattern.match(lines[j]):
-                unit_index = j
-                break
-
-        if unit_index is None:
-            continue
-
-        # Step 3: Find the test name before the unit
-        name_index = unit_index - 1
-
-        # Skip H/L flags
-        while (
-            name_index >= 0
-            and lines[name_index].upper() in ["H", "L", "HIGH", "LOW"]
-        ):
-            name_index -= 1
-
-        if name_index < 0:
-            continue
-
-        name = lines[name_index].strip()
-
-        # Avoid headings and duplicate rows
-        if name.lower() in excluded_names:
-            continue
-
-        if number_pattern.match(name):
-            continue
-
-        if len(name) > 60:
-            continue
-
-        if name in used_names:
-            continue
-
-        # Step 4: Find the result after the reference range
-        result = None
-
-        for k in range(i + 1, min(i + 4, len(lines))):
-
-            if number_pattern.match(lines[k]):
-                result = float(lines[k])
-                break
-
-        if result is None:
-            continue
-
-        # Step 5: Determine status against the stated range
-        if low <= result <= high:
-            status = "Within stated range"
-
-        elif result < low:
-            status = "Below stated range"
-
-        else:
-            status = "Above stated range"
-
-        rows.append({
-            "Parameter": name,
-            "Result": result,
-            "Unit": lines[unit_index],
-            "Reference range": f"{low:g} - {high:g}",
-            "Prototype status": status
         })
 
-        used_names.add(name)
+    pdf.close()
 
-    return rows
+    return extracted_pages
 
-# --------------------------------------------------
-# 5. BANGLA EXPLANATION
-# --------------------------------------------------
 
-def explain_status_bangla(status: str):
+# =========================================================
+# 5. TEXT CHUNKING
+# =========================================================
 
-    mapping = {
+def split_text_into_chunks(text, max_chars=MAX_CHUNK_SIZE):
 
-        "Within stated range":
-            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার মধ্যে আছে।",
+    lines = text.splitlines()
 
-        "Below stated range":
-            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার নিচে। "
-            "চিকিৎসকের সঙ্গে আলোচনা করুন।",
+    chunks = []
+    current_chunk = ""
 
-        "Above stated range":
-            "এই মানটি রিপোর্টে দেওয়া রেফারেন্স সীমার উপরে। "
-            "চিকিৎসকের সঙ্গে আলোচনা করুন।"
+    for line in lines:
+
+        if len(current_chunk) + len(line) > max_chars:
+
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+
+            current_chunk = line
+
+        else:
+
+            current_chunk += "\n" + line
+
+    if current_chunk.strip():
+
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+# =========================================================
+# 6. AI RESPONSE STRUCTURE
+# =========================================================
+
+OUTPUT_STRUCTURE = {
+
+    "report_type": "",
+
+    "report_purpose_bn": "",
+
+    "good_findings": [
+
+        {
+            "finding": "",
+            "result": "",
+            "reference_range": "",
+            "explanation_bn": ""
+        }
+
+    ],
+
+    "attention_findings": [
+
+        {
+            "finding": "",
+            "result": "",
+            "reference_range": "",
+            "explanation_bn": "",
+            "discussion_bn": ""
+        }
+
+    ],
+
+    "overall_summary_bn": "",
+
+    "important_observations_bn": [],
+
+    "patient_guidance_bn": [],
+
+    "limitations_bn": []
+
+}
+
+
+# =========================================================
+# 7. OLLAMA API CONNECTION
+# =========================================================
+
+def call_ollama(prompt, model):
+
+    url = f"{OLLAMA_URL}/api/chat"
+
+    payload = {
+
+        "model": model,
+
+        "messages": [
+
+            {
+                "role": "user",
+                "content": prompt
+            }
+
+        ],
+
+        "stream": False,
+
+        "format": "json",
+
+        "keep_alive": "10m",
+
+        "options": {
+
+            "temperature": 0.1,
+
+            "num_ctx": 4096,
+
+            "num_predict": 1200
+
+        }
+
     }
 
-    return mapping.get(
-        status,
-        "এই ফলাফলটি চিকিৎসকের সঙ্গে আলোচনা করুন।"
+    response = requests.post(
+
+        url,
+
+        json=payload,
+
+        timeout=(10, 600)
+
+    )
+
+    response.raise_for_status()
+
+    response_data = response.json()
+
+    ai_text = response_data["message"]["content"]
+
+    return json.loads(ai_text)
+
+
+# =========================================================
+# 8. MEDICAL REPORT AI PROMPT
+# =========================================================
+
+def build_analysis_prompt(report_text, final_analysis=False):
+
+    if final_analysis:
+
+        task_instruction = """
+
+        You are now analyzing the combined results of
+        multiple sections of the same medical report.
+
+        Consolidate all findings into one coherent analysis.
+
+        Remove duplicate findings.
+
+        Consider relationships between different findings.
+
+        Explain the overall report in simple Bangla.
+
+        Do not invent additional findings.
+
+        Do not treat individual findings as confirmed
+        diagnoses.
+
+        """
+
+    else:
+
+        task_instruction = """
+
+        Analyze this section of a medical report.
+
+        Identify all clearly recognizable findings.
+
+        Do not assume missing test names, values,
+        units or reference ranges.
+
+        Do not diagnose diseases.
+
+        """
+
+    prompt = f"""
+
+You are the specialized medical report understanding
+engine of MediInsight AI.
+
+Your task is to understand medical reports and explain
+their contents in simple, understandable Bangla.
+
+{task_instruction}
+
+
+IMPORTANT ANALYSIS INSTRUCTIONS:
+
+1. REPORT IDENTIFICATION
+
+Identify the type and purpose of the medical report.
+
+2. GOOD FINDINGS
+
+Identify results that are explicitly within their
+provided reference ranges.
+
+A finding should only be classified as good when
+the result and its reference range can be understood.
+
+Do not assume that a result is normal when no
+reference range or clear interpretation is provided.
+
+3. ATTENTION REQUIRED
+
+Identify results that are:
+
+- Above the provided reference range.
+- Below the provided reference range.
+- Explicitly flagged as H, L, High or Low.
+- Described as abnormal in the report.
+
+Explain what the finding means.
+
+An abnormal result does not automatically mean
+the patient has a disease.
+
+4. OVERALL REPORT ANALYSIS
+
+Consider the report as a whole.
+
+Explain:
+
+- What the report is about.
+- What the overall findings suggest.
+- Which observations are important.
+- Whether related findings should be considered together.
+
+5. GENERAL PATIENT GUIDANCE
+
+Provide safe, general information about what the
+patient may discuss with a qualified healthcare
+professional.
+
+Do not prescribe medicines.
+
+Do not recommend starting or stopping treatment.
+
+Do not provide a definitive diagnosis.
+
+6. ACCURACY
+
+Never invent:
+
+- Test results.
+- Reference ranges.
+- Patient information.
+- Diagnoses.
+- Medical history.
+
+If OCR text is unclear, acknowledge the uncertainty.
+
+If the report contains radiology or other imaging
+findings, explain only what is stated in its extracted
+written report. Do not claim to have examined the
+original medical image.
+
+7. LANGUAGE
+
+Write explanations in simple Bangla.
+
+Keep medical test names and technical terms in English
+where necessary.
+
+Avoid unnecessarily complicated medical language.
+
+
+RETURN VALID JSON USING THIS EXACT STRUCTURE:
+
+{json.dumps(OUTPUT_STRUCTURE, ensure_ascii=False)}
+
+
+MEDICAL REPORT CONTENT:
+
+{report_text}
+
+"""
+
+    return prompt
+
+
+# =========================================================
+# 9. ANALYZE INDIVIDUAL REPORT SECTIONS
+# =========================================================
+
+def analyze_report_chunks(pages, model):
+
+    all_chunks = []
+
+    for page in pages:
+
+        chunks = split_text_into_chunks(
+            page["text"]
+        )
+
+        for chunk in chunks:
+
+            all_chunks.append({
+
+                "page": page["page"],
+
+                "text": chunk
+
+            })
+
+    if not all_chunks:
+
+        raise ValueError(
+            "No readable text found in the PDF."
+        )
+
+    partial_results = []
+
+    progress = st.progress(0)
+
+    status = st.empty()
+
+    total = len(all_chunks)
+
+    for index, chunk in enumerate(all_chunks):
+
+        status.info(
+
+            f"AI analyzing section {index + 1} of {total}..."
+
+        )
+
+        prompt = build_analysis_prompt(
+
+            f"Page {chunk['page']}:\n{chunk['text']}",
+
+            final_analysis=False
+
+        )
+
+        result = call_ollama(prompt, model)
+
+        partial_results.append(result)
+
+        progress.progress(
+            (index + 1) / total
+        )
+
+    progress.empty()
+
+    status.empty()
+
+    return partial_results
+
+
+# =========================================================
+# 10. CONSOLIDATE ANALYSIS
+# =========================================================
+
+def consolidate_analysis(partial_results, model):
+
+    results = partial_results
+
+    # Reduce large collections in groups.
+    while len(results) > 3:
+
+        reduced_results = []
+
+        for start in range(0, len(results), 3):
+
+            group = results[start:start + 3]
+
+            prompt = build_analysis_prompt(
+
+                json.dumps(
+                    group,
+                    ensure_ascii=False
+                ),
+
+                final_analysis=True
+
+            )
+
+            merged = call_ollama(prompt, model)
+
+            reduced_results.append(merged)
+
+        results = reduced_results
+
+    final_prompt = build_analysis_prompt(
+
+        json.dumps(
+            results,
+            ensure_ascii=False
+        ),
+
+        final_analysis=True
+
+    )
+
+    return call_ollama(
+        final_prompt,
+        model
     )
 
 
-# --------------------------------------------------
-# 6. PDF UPLOAD
-# --------------------------------------------------
+# =========================================================
+# 11. COMPLETE REPORT ANALYSIS
+# =========================================================
 
-uploaded = st.file_uploader(
-    "Upload a medical report (PDF)",
+def generate_ai_analysis(pages, model):
+
+    partial_results = analyze_report_chunks(
+
+        pages,
+
+        model
+
+    )
+
+    final_result = consolidate_analysis(
+
+        partial_results,
+
+        model
+
+    )
+
+    return final_result
+
+
+# =========================================================
+# 12. DISPLAY GOOD FINDINGS
+# =========================================================
+
+def display_good_findings(findings):
+
+    st.subheader("🟢 Good Findings")
+
+    st.caption(
+        "Results identified as within their stated "
+        "reference ranges."
+    )
+
+    if not findings:
+
+        st.info(
+            "No findings could be confidently classified "
+            "as within the stated reference ranges."
+        )
+
+        return
+
+    for item in findings:
+
+        with st.container(border=True):
+
+            st.markdown(
+                f"**{item.get('finding', 'Finding')}**"
+            )
+
+            st.write(
+                f"Result: {item.get('result', 'Not available')}"
+            )
+
+            st.write(
+                f"Reference range: "
+                f"{item.get('reference_range', 'Not available')}"
+            )
+
+            st.write(
+                item.get(
+                    "explanation_bn",
+                    "ব্যাখ্যা পাওয়া যায়নি।"
+                )
+            )
+
+
+# =========================================================
+# 13. DISPLAY ATTENTION FINDINGS
+# =========================================================
+
+def display_attention_findings(findings):
+
+    st.subheader("🟠 Attention Required")
+
+    st.caption(
+        "Results identified as outside their stated "
+        "reference ranges or explicitly flagged."
+    )
+
+    if not findings:
+
+        st.info(
+            "No clearly out-of-range findings were "
+            "identified by the AI. This does not mean "
+            "that the entire report is normal."
+        )
+
+        return
+
+    for item in findings:
+
+        with st.container(border=True):
+
+            st.markdown(
+                f"**{item.get('finding', 'Finding')}**"
+            )
+
+            st.write(
+                f"Result: {item.get('result', 'Not available')}"
+            )
+
+            st.write(
+                f"Reference range: "
+                f"{item.get('reference_range', 'Not available')}"
+            )
+
+            st.write(
+                item.get(
+                    "explanation_bn",
+                    "ব্যাখ্যা পাওয়া যায়নি।"
+                )
+            )
+
+            discussion = item.get("discussion_bn", "")
+
+            if discussion:
+
+                st.info(
+                    f"চিকিৎসকের সঙ্গে আলোচনা: {discussion}"
+                )
+
+
+# =========================================================
+# 14. DISPLAY OVERALL ANALYSIS
+# =========================================================
+
+def display_overall_analysis(analysis):
+
+    st.subheader("🔵 Overall Report Analysis")
+
+    with st.container(border=True):
+
+        st.markdown("### Report Identification")
+
+        st.write(
+            analysis.get(
+                "report_type",
+                "Not identified"
+            )
+        )
+
+        st.write(
+            analysis.get(
+                "report_purpose_bn",
+                ""
+            )
+        )
+
+        st.divider()
+
+        st.markdown("### সামগ্রিক রিপোর্ট বিশ্লেষণ")
+
+        st.write(
+            analysis.get(
+                "overall_summary_bn",
+                "সারাংশ পাওয়া যায়নি।"
+            )
+        )
+
+        st.divider()
+
+        st.markdown("### গুরুত্বপূর্ণ পর্যবেক্ষণ")
+
+        observations = analysis.get(
+            "important_observations_bn",
+            []
+        )
+
+        for observation in observations:
+
+            st.markdown(f"- {observation}")
+
+        st.divider()
+
+        st.markdown("### সাধারণ পরামর্শ")
+
+        guidance = analysis.get(
+            "patient_guidance_bn",
+            []
+        )
+
+        for advice in guidance:
+
+            st.markdown(f"- {advice}")
+
+        st.divider()
+
+        st.markdown("### সীমাবদ্ধতা ও সতর্কতা")
+
+        limitations = analysis.get(
+            "limitations_bn",
+            []
+        )
+
+        for limitation in limitations:
+
+            st.markdown(f"- {limitation}")
+
+
+# =========================================================
+# 15. SIDEBAR SETTINGS
+# =========================================================
+
+with st.sidebar:
+
+    st.header("⚙️ AI Settings")
+
+    model = st.text_input(
+
+        "Ollama Model",
+
+        value=DEFAULT_MODEL
+
+    )
+
+    st.caption(
+        "The model must already be downloaded "
+        "and available in Ollama."
+    )
+
+    st.divider()
+
+    st.markdown("### System Status")
+
+    st.write("AI Runtime: Ollama")
+
+    st.write("Processing: Local")
+
+    st.write("Language: Bangla + English")
+
+    st.write("AI Model:", model)
+
+    if OCR_AVAILABLE:
+
+        st.success("OCR Python package available")
+
+    else:
+
+        st.warning(
+            "OCR Python package unavailable. "
+            "Scanned PDFs may not work."
+        )
+
+
+# =========================================================
+# 16. PDF UPLOAD
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">Upload Medical Report</div>',
+    unsafe_allow_html=True
+)
+
+uploaded_file = st.file_uploader(
+
+    "Select your medical report (PDF)",
+
     type=["pdf"]
+
+)
+
+run_ocr = st.checkbox(
+
+    "Run OCR on every page (useful for scanned or "
+    "image-based reports)",
+
+    value=False,
+
+    disabled=not OCR_AVAILABLE
+
 )
 
 
-if uploaded:
+# =========================================================
+# 17. PROCESS REPORT
+# =========================================================
 
-    pdf_bytes = uploaded.getvalue()
+if uploaded_file is not None:
 
-    # File size validation
-    if len(pdf_bytes) > 15 * 1024 * 1024:
+    if uploaded_file.size > MAX_FILE_SIZE:
 
         st.error(
-            "For this prototype, please upload a PDF smaller than 15 MB."
+            "File size exceeds the 20 MB limit."
         )
 
-        st.stop()
+    else:
 
-    # --------------------------------------------------
-    # 7. PROCESS ALL PDF PAGES
-    # --------------------------------------------------
+        st.success(
+            f"Uploaded: {uploaded_file.name}"
+        )
 
-    try:
-
-        with st.spinner(
-            "Processing PDF pages. OCR may take some time..."
+        if st.button(
+            "🩺 Analyze Medical Report",
+            type="primary",
+            use_container_width=True
         ):
 
-            pages = extract_pdf_content(pdf_bytes)
+            try:
 
-        # Combine text from all pages
-        extracted_text = "\n\n".join(
-            f"--- Page {page['page']} ---\n{page['text']}"
-            for page in pages
-        )
+                with st.spinner(
+                    "Extracting medical report..."
+                ):
 
-    except Exception as e:
+                    pdf_bytes = uploaded_file.getvalue()
 
-        st.error(str(e))
-        st.stop()
+                    extracted_pages = extract_pdf_content(
 
-    # --------------------------------------------------
-    # 8. EXTRACTION SUMMARY
-    # --------------------------------------------------
+                        pdf_bytes,
 
-    total_pages = len(pages)
+                        run_ocr
 
-    total_characters = sum(
-        page["characters"] for page in pages
-    )
+                    )
 
-    ocr_pages = sum(
-        1 for page in pages if page["ocr_used"]
-    )
+                full_text = "\n".join(
 
-    st.success(
-        f"PDF processing completed. "
-        f"Detected category: {classify_report(extracted_text)}"
-    )
+                    page["text"]
 
-    # --------------------------------------------------
-    # 9. TABS
-    # --------------------------------------------------
+                    for page in extracted_pages
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "Overview",
-        "Extracted Text",
-        "Page Diagnostics",
-        "Structured Findings"
-    ])
-
-    # --------------------------------------------------
-    # TAB 1: OVERVIEW
-    # --------------------------------------------------
-
-    with tab1:
-
-        report_type = classify_report(extracted_text)
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Total Pages",
-            total_pages
-        )
-
-        col2.metric(
-            "Extracted Characters",
-            f"{total_characters:,}"
-        )
-
-        col3.metric(
-            "OCR Pages",
-            ocr_pages
-        )
-
-        st.subheader("Report Information")
-
-        st.write(
-            f"**Detected Report Category:** {report_type}"
-        )
-
-        st.write(
-            f"**Total Pages Processed:** {total_pages}"
-        )
-
-        st.write(
-            f"**Pages Processed Using OCR:** {ocr_pages}"
-        )
-
-        st.info(
-            "This prototype identifies report categories using keywords "
-            "and extracts basic text. It does not yet interpret medical "
-            "images, ECG waveforms, or diagnose conditions."
-        )
-
-    # --------------------------------------------------
-    # TAB 2: EXTRACTED TEXT
-    # --------------------------------------------------
-
-    with tab2:
-
-        st.subheader("Complete Extracted Report")
-
-        st.text_area(
-            "Extracted PDF Text",
-            extracted_text,
-            height=600
-        )
-
-        st.download_button(
-            label="Download Extracted Text",
-            data=extracted_text,
-            file_name="extracted_medical_report.txt",
-            mime="text/plain"
-        )
-
-    # --------------------------------------------------
-    # TAB 3: PAGE DIAGNOSTICS
-    # --------------------------------------------------
-
-    with tab3:
-
-        st.subheader("Page-by-Page Extraction Status")
-
-        for page in pages:
-
-            with st.expander(
-                f"Page {page['page']} — "
-                f"{page['method']} — "
-                f"{page['characters']} characters"
-            ):
-
-                st.write(
-                    f"**Extraction Method:** {page['method']}"
                 )
 
-                st.write(
-                    f"**Extracted Characters:** {page['characters']}"
+                if not full_text.strip():
+
+                    st.error(
+                        "No readable text could be extracted "
+                        "from this PDF."
+                    )
+
+                    st.stop()
+
+                # Show extracted text for verification.
+                with st.expander(
+                    "View Extracted Report Text"
+                ):
+
+                    st.text(full_text)
+
+                st.info(
+                    f"Extracted {len(extracted_pages)} pages."
                 )
 
-                if page["ocr_used"]:
-                    st.info("OCR was applied to this page.")
+                with st.spinner(
+                    "Checking connection with Ollama..."
+                ):
 
-                else:
-                    st.success(
-                        "Selectable PDF text was extracted."
+                    requests.get(
+                        f"{OLLAMA_URL}/api/tags",
+                        timeout=10
+                    ).raise_for_status()
+
+                with st.spinner(
+                    "MediInsight AI is analyzing your complete report. "
+                    "This may take some time..."
+                ):
+
+                    analysis = generate_ai_analysis(
+
+                        extracted_pages,
+
+                        model
+
                     )
 
-                if page["characters"] < 30:
+                st.session_state["analysis"] = analysis
 
-                    st.warning(
-                        "Very little readable text was detected. "
-                        "Please verify this page against the original PDF."
-                    )
-
-                st.text_area(
-                    f"Page {page['page']} content",
-                    page["text"],
-                    height=200,
-                    key=f"page_text_{page['page']}"
+                st.success(
+                    "Medical report analysis completed!"
                 )
 
-    # --------------------------------------------------
-    # TAB 4: STRUCTURED FINDINGS
-    # --------------------------------------------------
+            except requests.exceptions.ConnectionError:
 
-    with tab4:
+                st.error(
+                    "Cannot connect to Ollama. "
+                    "Please ensure Ollama is running."
+                )
 
-        lab_rows = parse_simple_lab_rows(extracted_text)
+            except requests.exceptions.Timeout:
 
-        if lab_rows:
+                st.error(
+                    "AI processing timed out. "
+                    "Try again with a shorter report."
+                )
 
-            st.subheader("Possible Laboratory Values")
+            except requests.exceptions.HTTPError as error:
 
-            st.caption(
-                "Experimental extraction only. "
-                "Verify every value against the original report."
-            )
+                st.error(
+                    f"Ollama API error: {error}"
+                )
 
-            st.dataframe(
-                lab_rows,
-                use_container_width=True,
-                hide_index=True
-            )
+            except Exception as error:
 
-            st.subheader("Result Overview")
-
-            for index, row in enumerate(lab_rows):
-
-                with st.container(border=True):
-
-                    st.markdown(
-                        f"**{row['Parameter']} — "
-                        f"{row['Result']} {row['Unit']}**"
-                    )
-
-                    st.write(
-                        f"Reference Range: {row['Reference range']}"
-                    )
-
-                    status = row["Prototype status"]
-
-                    if status == "Within stated range":
-
-                        st.success(status)
-
-                    else:
-
-                        st.warning(status)
-
-                    st.write(
-                        explain_status_bangla(status)
-                    )
-
-        else:
-
-            st.info(
-                "No simple laboratory values were detected. "
-                "This is expected for many radiology, cardiology, "
-                "and narrative reports. A report-specific extraction "
-                "module is needed for each document family."
-            )
+                st.error(
+                    f"Analysis failed: {error}"
+                )
 
 
-# --------------------------------------------------
-# 10. INITIAL SCREEN
-# --------------------------------------------------
+# =========================================================
+# 18. DISPLAY AI RESULTS
+# =========================================================
 
-else:
+if "analysis" in st.session_state:
 
-    st.markdown("### Planned Workflow")
+    analysis = st.session_state["analysis"]
 
-    st.write(
-        "1. Upload PDF"
-        "  →  2. Extract Text"
-        "  →  3. Structure Findings"
-        "  →  4. Explain in Bangla / English"
-        "  →  5. Ask Follow-up Questions"
+    st.divider()
+
+    st.markdown(
+        '<div class="section-title">'
+        'Medical Report Analysis'
+        '</div>',
+        unsafe_allow_html=True
     )
 
-    st.info(
-        "Start with anonymized sample reports. "
-        "Both text-based and scanned PDFs are supported by the prototype."
-    )
+    # Two finding grids
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        display_good_findings(
+
+            analysis.get(
+                "good_findings",
+                []
+            )
+
+        )
+
+    with col2:
+
+        display_attention_findings(
+
+            analysis.get(
+                "attention_findings",
+                []
+            )
+
+        )
+
+    st.divider()
+
+    # Overall analysis
+    display_overall_analysis(analysis)
+
+
+# =========================================================
+# 19. FOOTER
+# =========================================================
+
+st.markdown("""
+<div class="footer">
+
+    <b>MediInsight AI</b><br>
+
+    Developed by: Anupam Roy<br>
+
+    A Student of PMIT<br>
+
+    Medical Report Understanding Assistant<br>
+
+    © 2026 MediInsight AI. All Rights Reserved.<br><br>
+
+    <small>
+    This application provides educational information
+    and does not replace professional medical advice.
+    </small>
+
+</div>
+""", unsafe_allow_html=True)
