@@ -14,7 +14,26 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+OLLAMA_URL = "http://127.0.0.1:11434"
 
+def check_ollama_connection():
+
+    try:
+        response = requests.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=5
+        )
+
+        if response.status_code == 200:
+            return True
+
+        return False
+
+    except requests.exceptions.ConnectionError:
+        return False
+
+    except requests.exceptions.Timeout:
+        return False
 # =========================================================
 # 1. APPLICATION CONFIGURATION
 # =========================================================
@@ -318,14 +337,10 @@ def call_ollama(prompt, model):
     }
 
     response = requests.post(
-
-        url,
-
-        json=payload,
-
-        timeout=(10, 600)
-
-    )
+    f"{OLLAMA_URL}/api/chat",
+    json=payload,
+    timeout=(10, 600)
+)
 
     response.raise_for_status()
 
