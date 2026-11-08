@@ -44,7 +44,7 @@ st.set_page_config(
     layout="wide"
 )
 
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:3b"
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
