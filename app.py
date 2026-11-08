@@ -1,6 +1,11 @@
 import re
 import streamlit as st
 import pymupdf
+import fitz
+import pytesseract
+
+from PIL import Image
+from io import BytesIO
 
 st.set_page_config(page_title="MediInsight AI", page_icon="🩺", layout="wide")
 
@@ -20,6 +25,44 @@ def extract_pdf_text(pdf_bytes: bytes):
         pages.append(f"\n--- Page {page_no} ---\n{page.get_text('text')}")
     doc.close()
     return "\n".join(pages).strip()
+
+def extract_pdf_content(pdf_file):
+
+    doc = fitz.open(stream=pdf_file, filetype="pdf")
+
+    extracted_pages = []
+
+    for page_number, page in enumerate(doc, start=1):
+
+        # Step 1: Extract selectable text
+        text = page.get_text("text").strip()
+
+        # Step 2: Check whether OCR is required
+        if len(text) < 50:
+
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                alpha=False
+            )
+
+            image = Image.open(
+                BytesIO(pix.tobytes("png"))
+            )
+
+            # Step 3: Apply OCR
+            text = pytesseract.image_to_string(
+                image,
+                lang="eng"
+            )
+
+        extracted_pages.append({
+            "page": page_number,
+            "text": text.strip()
+        })
+
+    doc.close()
+
+    return extracted_pages
 
 def classify_report(text: str) -> str:
     t = text.lower()
